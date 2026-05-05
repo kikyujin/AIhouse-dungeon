@@ -6,7 +6,7 @@
 
 https://kikyujin.github.io/AIhouse-dungeon/
 
-- 方向キー or スワイプで移動
+- 方向キー or D-PAD タッチで移動
 - ダンジョンを探索して階段を見つけよう
 
 ## 技術スタック
