@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🏰 AI館ダンジョン</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #0d0d1a; height: 100%; overflow-y: auto; }
+  #root { min-height: 100%; display: flex; justify-content: center;
+    -webkit-user-select: none; -webkit-touch-callout: none; user-select: none; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ============================================================
+// CONFIG
+// ============================================================
+const MAP_W = 40;
+const MAP_H = 24;
+const FOV_RADIUS = 6;
+const MAX_ROOMS = 9;
+const ROOM_MIN = 4;
+const ROOM_MAX = 9;
+let MONSTERS_PER_FLOOR = 6;
+let ITEMS_PER_FLOOR = 7;
+let MAX_FLOOR = 5;
+
+// Responsive layout
+function useLayout() {
+  const calc = () => {
+    const w = window.innerWidth;
+    const isMobile = w < 600;
+    const tileSize = isMobile ? Math.floor((w - 24) / 15) : 24;
+    const vpW = isMobile ? 15 : Math.min(MAP_W, 30);
+    const vpH = isMobile ? 12 : Math.min(MAP_H, 20);
+    return { tileSize, vpW, vpH, isMobile };
+  };
+  const [layout, setLayout] = useState(calc);
+  useEffect(() => {
+    const onResize = () => setLayout(calc());
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return layout;
+}
+
+// Tile types
+const T = { WALL: 0, FLOOR: 1, DOOR_CLOSED: 2, DOOR_OPEN: 5, STAIR_DOWN: 3, STAIR_UP: 4, TREASURE: 6 };
+
+// Tile visuals
+const TILE_CH = {
+  [T.WALL]: { ch: "", bg: "#2a2a3d", fg: "#555" },
+  [T.FLOOR]: { ch: "·", bg: "#1a1a2e", fg: "#444" },
+  [T.DOOR_CLOSED]: { ch: "🚪", bg: "#1a1a2e", fg: "#a87832" },
+  [T.DOOR_OPEN]: { ch: "▫", bg: "#1a1a2e", fg: "#a87832" },
+  [T.STAIR_DOWN]: { ch: "🕳️", bg: "#1a1a2e", fg: "#6cf" },
+  [T.STAIR_UP]: { ch: "⬆️", bg: "#1a1a2e", fg: "#fc6" },
+  [T.TREASURE]: { ch: "👑", bg: "#1a1a2e", fg: "#ff0" },
+};
+
+const MONSTER_DEFS = [
+  { name: "スライム", ch: "🟢", hp: 3, atk: 1, exp: 2, color: "#0f0" },
+  { name: "コウモリ", ch: "🦇", hp: 2, atk: 1, exp: 1, color: "#a6f" },
+  { name: "ゴブリン", ch: "👺", hp: 8, atk: 3, exp: 4, color: "#f80" },
+  { name: "スケルトン", ch: "💀", hp: 14, atk: 5, exp: 8, color: "#ff8" },
+  { name: "ゴースト", ch: "👻", hp: 24, atk: 8, exp: 15, color: "#aaf" },
+  { name: "オーク", ch: "🧌", hp: 40, atk: 13, exp: 25, color: "#8b4" },
+  { name: "ドラゴン", ch: "🐉", hp: 65, atk: 20, exp: 50, color: "#f44" },
+];
+
+const ITEM_DEFS = [
+  { name: "薬草", ch: "🌱", type: "heal", value: 5, color: "#4a4", weight: 5 },
+  { name: "エリクサー", ch: "🧪", type: "heal", value: 20, color: "#f4a", weight: 2 },
+  { name: "女神の雫", ch: "🔮", type: "fullheal", value: 0, color: "#c4f", weight: 1 },
+  { name: "剣", ch: "🗡️", type: "weapon", value: 2, color: "#adf", weight: 2 },
+  { name: "魔剣", ch: "⚔️", type: "weapon", value: 5, color: "#f4f", weight: 1 },
+  { name: "盾", ch: "🛡️", type: "armor", value: 2, color: "#fa0", weight: 2 },
+  { name: "巻物", ch: "📜", type: "scroll", value: 0, color: "#ff8", weight: 2 },
+  { name: "金貨", ch: "🪙", type: "gold", value: 10, color: "#ff0", weight: 3 },
+];
+
+// ============================================================
+// UTILS
+// ============================================================
+const rng = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const dist = (x1, y1, x2, y2) => Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
+const weightedPick = (defs) => {
+  const total = defs.reduce((s, d) => s + (d.weight || 1), 0);
+  let r = Math.random() * total;
+  for (const d of defs) { r -= d.weight || 1; if (r <= 0) return d; }
+  return defs[defs.length - 1];
+};
+
+// ============================================================
+// DUNGEON GENERATION
+// ============================================================
+function generateDungeon(floor) {
+  const map = Array.from({ length: MAP_H }, () => Array(MAP_W).fill(T.WALL));
+  const rooms = [];
+
+  const numRooms = rng(5, MAX_ROOMS);
+  for (let i = 0; i < numRooms * 20 && rooms.length < numRooms; i++) {
+    const w = rng(ROOM_MIN, ROOM_MAX);
+    const h = rng(ROOM_MIN, ROOM_MAX);
+    const x = rng(1, MAP_W - w - 1);
+    const y = rng(1, MAP_H - h - 1);
+    if (rooms.some((r) => x <= r.x + r.w && x + w >= r.x && y <= r.y + r.h && y + h >= r.y)) continue;
+    rooms.push({ x, y, w, h });
+    for (let ry = y; ry < y + h; ry++)
+      for (let rx = x; rx < x + w; rx++) map[ry][rx] = T.FLOOR;
+  }
+
+  for (let i = 1; i < rooms.length; i++) {
+    const a = rooms[i - 1], b = rooms[i];
+    let cx = Math.floor(a.x + a.w / 2), cy = Math.floor(a.y + a.h / 2);
+    const tx = Math.floor(b.x + b.w / 2), ty = Math.floor(b.y + b.h / 2);
+    while (cx !== tx) { map[cy][cx] = map[cy][cx] === T.WALL ? T.FLOOR : map[cy][cx]; cx += cx < tx ? 1 : -1; }
+    while (cy !== ty) { map[cy][cx] = map[cy][cx] === T.WALL ? T.FLOOR : map[cy][cx]; cy += cy < ty ? 1 : -1; }
+  }
+
+  rooms.forEach((r) => {
+    for (let ry = r.y; ry < r.y + r.h; ry++) {
+      for (const rx of [r.x - 1, r.x + r.w]) {
+        if (rx >= 0 && rx < MAP_W && map[ry][rx] === T.FLOOR) {
+          if (Math.random() < 0.3) map[ry][clamp(rx === r.x - 1 ? r.x : r.x + r.w - 1, 0, MAP_W - 1)] = T.DOOR_CLOSED;
+        }
+      }
+    }
+  });
+
+  const lastRoom = rooms[rooms.length - 1];
+  const sx = Math.floor(lastRoom.x + lastRoom.w / 2);
+  const sy = Math.floor(lastRoom.y + lastRoom.h / 2);
+  if (floor < MAX_FLOOR) map[sy][sx] = T.STAIR_DOWN;
+  if (floor === MAX_FLOOR) map[sy][sx] = T.TREASURE;
+
+  const firstRoom = rooms[0];
+  if (floor > 1) {
+    map[Math.floor(firstRoom.y + firstRoom.h / 2)][Math.floor(firstRoom.x + firstRoom.w / 2)] = T.STAIR_UP;
+  }
+
+  return { map, rooms };
+}
+
+// FOV
+function computeFov(map, px, py, radius) {
+  const visible = Array.from({ length: MAP_H }, () => Array(MAP_W).fill(false));
+  for (let a = 0; a < 360; a += 1.5) {
+    const rad = (a * Math.PI) / 180;
+    const dx = Math.cos(rad) * 0.5, dy = Math.sin(rad) * 0.5;
+    let x = px + 0.5, y = py + 0.5;
+    for (let step = 0; step < radius * 2; step++) {
+      const ix = Math.floor(x), iy = Math.floor(y);
+      if (ix < 0 || ix >= MAP_W || iy < 0 || iy >= MAP_H) break;
+      if (Math.abs(ix - px) > radius || Math.abs(iy - py) > radius) break;
+      if (dist(px, py, ix, iy) > radius) break;
+      visible[iy][ix] = true;
+      if (map[iy][ix] === T.WALL || map[iy][ix] === T.DOOR_CLOSED) break;
+      x += dx; y += dy;
+    }
+  }
+  return visible;
+}
+
+// ============================================================
+// GAME COMPONENT
+// ============================================================
+function StartScreen({ onStart }) {
+  const layout = useLayout();
+  const isMobile = layout.isMobile;
+  return (
+    <div style={{
+      background: "#0d0d1a", color: "#ddd", fontFamily: "'Courier New', monospace",
+      width: "100%", maxWidth: isMobile ? "100%" : 820, margin: "0 auto", padding: isMobile ? 16 : 32,
+      display: "flex", flexDirection: "column", gap: 16, minHeight: "100vh", justifyContent: "center",
+    }}>
+      <div style={{ textAlign: "center", fontSize: isMobile ? 18 : 24, fontWeight: "bold", color: "#f8d870" }}>
+        🏰 AI館ダンジョン
+      </div>
+      <div style={{ textAlign: "center", fontSize: isMobile ? 13 : 15, color: "#ccc", margin: "8px 0" }}>
+        ダンジョンから 👑 を探してね！
+      </div>
+      <div style={{ background: "#1a1a2e", border: "1px solid #2a2a4a", borderRadius: 8, padding: isMobile ? 12 : 16 }}>
+        <div style={{ fontSize: isMobile ? 11 : 13, color: "#aaa", marginBottom: 8, fontWeight: "bold" }}>🗡️ アイテム</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 12px", fontSize: isMobile ? 11 : 12, lineHeight: 1.8 }}>
+          {ITEM_DEFS.map((item, i) => (
+            <span key={i} style={{ color: item.color }}>{item.ch} {item.name}</span>
+          ))}
+        </div>
+      </div>
+      <div style={{ background: "#1a1a2e", border: "1px solid #2a2a4a", borderRadius: 8, padding: isMobile ? 12 : 16 }}>
+        <div style={{ fontSize: isMobile ? 11 : 13, color: "#aaa", marginBottom: 8, fontWeight: "bold" }}>👾 モンスター</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 12px", fontSize: isMobile ? 11 : 12, lineHeight: 1.8 }}>
+          {MONSTER_DEFS.map((m, i) => (
+            <span key={i} style={{ color: m.color }}>{m.ch} {m.name}</span>
+          ))}
+        </div>
+      </div>
+      <div style={{ textAlign: "center", fontSize: isMobile ? 11 : 12, color: "#888", margin: "4px 0" }}>
+        🦊 = あなた　｜　矢印/WASD で移動　｜　QEZCで斜め移動
+      </div>
+      <div style={{ textAlign: "center", marginTop: 8 }}>
+        <button onClick={onStart} style={{
+          padding: "14px 48px", background: "#4a4", color: "#fff", border: "none",
+          borderRadius: 8, fontSize: isMobile ? 16 : 18, cursor: "pointer", fontWeight: "bold",
+        }}>
+          OK スタート！
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RoguelikeGame() {
+  const [started, setStarted] = useState(false);
+  const [gameState, setGameState] = useState(null);
+  const [messages, setMessages] = useState(["⚔️ 地下1階(R1)へようこそ！矢印キーまたはWASDで移動"]);
+  const containerRef = useRef(null);
+  const floorCacheRef = useRef({});
+  const layout = useLayout();
+
+  const addMsg = useCallback((msg) => {
+    setMessages((prev) => [...prev.slice(-50), msg]);
+  }, []);
+
+  const saveFloor = useCallback((gs) => {
+    if (!gs) return;
+    floorCacheRef.current[gs.floor] = {
+      map: gs.map.map((row) => [...row]),
+      rooms: gs.rooms,
+      monsters: gs.monsters.map((m) => ({ ...m })),
+      items: gs.items.map((i) => ({ ...i })),
+      explored: gs.explored.map((row) => [...row]),
+    };
+  }, []);
+
+  const findTile = (map, tileType) => {
+    for (let y = 0; y < MAP_H; y++)
+      for (let x = 0; x < MAP_W; x++)
+        if (map[y][x] === tileType) return { x, y };
+    return null;
+  };
+
+  const initGame = useCallback((floor = 1, prevPlayer = null, fromDir = null) => {
+    const cached = floorCacheRef.current[floor];
+    let map, rooms, monsters, items, explored;
+
+    if (cached) {
+      map = cached.map.map((row) => [...row]);
+      rooms = cached.rooms;
+      monsters = cached.monsters.map((m) => ({ ...m }));
+      items = cached.items.map((i) => ({ ...i }));
+      explored = cached.explored.map((row) => [...row]);
+    } else {
+      const gen = generateDungeon(floor);
+      map = gen.map; rooms = gen.rooms;
+
+      monsters = [];
+      const count = MONSTERS_PER_FLOOR + Math.floor(floor * 0.5);
+      const occupied = new Set();
+      for (let i = 0; i < count; i++) {
+        for (let tries = 0; tries < 20; tries++) {
+          const room = rooms[rng(1, rooms.length - 1)] || rooms[0];
+          const mx = rng(room.x + 1, room.x + room.w - 2);
+          const my = rng(room.y + 1, room.y + room.h - 2);
+          const key = `${mx},${my}`;
+          if (map[my][mx] !== T.FLOOR || occupied.has(key)) continue;
+          occupied.add(key);
+          const tier = Math.min(rng(0, floor + 1), MONSTER_DEFS.length - 1);
+          const def = MONSTER_DEFS[tier];
+          const floorScale = 1 + (floor - 1) * 0.3;
+          monsters.push({ ...def, x: mx, y: my, hp: Math.ceil(def.hp * floorScale), maxHp: Math.ceil(def.hp * floorScale), atk: Math.ceil(def.atk * floorScale), id: `m${i}_${Date.now()}` });
+          break;
+        }
+      }
+
+      items = [];
+      for (let i = 0; i < ITEMS_PER_FLOOR; i++) {
+        for (let tries = 0; tries < 20; tries++) {
+          const room = rooms[rng(0, rooms.length - 1)];
+          const ix = rng(room.x + 1, room.x + room.w - 2);
+          const iy = rng(room.y + 1, room.y + room.h - 2);
+          const key = `${ix},${iy}`;
+          if (map[iy][ix] !== T.FLOOR || occupied.has(key)) continue;
+          occupied.add(key);
+          const def = weightedPick(ITEM_DEFS);
+          items.push({ ...def, x: ix, y: iy, id: `i${i}_${Date.now()}` });
+          break;
+        }
+      }
+      explored = Array.from({ length: MAP_H }, () => Array(MAP_W).fill(false));
+    }
+
+    let px, py;
+    if (fromDir === 'down') {
+      const pos = findTile(map, T.STAIR_UP);
+      if (pos) { px = pos.x; py = pos.y; } else { px = Math.floor(rooms[0].x + rooms[0].w / 2); py = Math.floor(rooms[0].y + rooms[0].h / 2); }
+    } else if (fromDir === 'up') {
+      const pos = findTile(map, T.STAIR_DOWN);
+      if (pos) { px = pos.x; py = pos.y; } else { const r = rooms[rooms.length - 1]; px = Math.floor(r.x + r.w / 2); py = Math.floor(r.y + r.h / 2); }
+    } else {
+      px = Math.floor(rooms[0].x + rooms[0].w / 2);
+      py = Math.floor(rooms[0].y + rooms[0].h / 2);
+    }
+
+    monsters = monsters.filter((m) => !(m.x === px && m.y === py));
+
+    const player = prevPlayer || {
+      hp: 30, maxHp: 30, atk: 3, def: 1,
+      level: 1, exp: 0, expNext: 10, gold: 0, inventory: [],
+    };
+
+    const visible = computeFov(map, px, py, FOV_RADIUS);
+    for (let y = 0; y < MAP_H; y++)
+      for (let x = 0; x < MAP_W; x++) if (visible[y][x]) explored[y][x] = true;
+
+    setGameState({
+      map, rooms, monsters, items,
+      player: { ...player, x: px, y: py },
+      floor, explored, visible,
+      turn: 0, gameOver: false, victory: false,
+    });
+  }, []);
+
+  useEffect(() => { if (started) initGame(); }, [started, initGame]);
+
+  const processTurn = useCallback((gs) => {
+    let { monsters, player, map } = gs;
+    const newMonsters = [];
+
+    for (const m of monsters) {
+      if (m.hp <= 0) continue;
+      const d = dist(m.x, m.y, player.x, player.y);
+      if (d <= 1.5) {
+        if (Math.random() < 0.2) {
+          addMsg(`${m.ch} ${m.name}の攻撃！ ...ハズレ！`);
+        } else {
+          const dmg = Math.max(1, m.atk - player.def + rng(-1, 1));
+          player = { ...player, hp: player.hp - dmg };
+          addMsg(`${m.ch} ${m.name}の攻撃！ ${dmg}ダメージ`);
+        }
+      } else if (d < 8) {
+        let dx = Math.sign(player.x - m.x), dy = Math.sign(player.y - m.y);
+        const nx = m.x + dx, ny = m.y + dy;
+        if (nx >= 0 && nx < MAP_W && ny >= 0 && ny < MAP_H &&
+            map[ny][nx] !== T.WALL && map[ny][nx] !== T.DOOR_CLOSED &&
+            !newMonsters.some((om) => om.x === nx && om.y === ny)) {
+          newMonsters.push({ ...m, x: nx, y: ny }); continue;
+        }
+      }
+      newMonsters.push({ ...m });
+    }
+    return { ...gs, monsters: newMonsters, player, turn: gs.turn + 1 };
+  }, [addMsg]);
+
+  const movePlayer = useCallback((dx, dy) => {
+    setGameState((prev) => {
+      if (!prev || prev.gameOver || prev.victory) return prev;
+      let gs = { ...prev };
+      const nx = gs.player.x + dx, ny = gs.player.y + dy;
+      if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) return gs;
+      if (gs.map[ny][nx] === T.WALL) return gs;
+
+      if (gs.map[ny][nx] === T.DOOR_CLOSED) {
+        const newMap = gs.map.map((row) => [...row]);
+        newMap[ny][nx] = T.DOOR_OPEN;
+        addMsg("🚪 ドアを開けた");
+        const visible = computeFov(newMap, gs.player.x, gs.player.y, FOV_RADIUS);
+        const explored = gs.explored.map((row) => [...row]);
+        for (let y = 0; y < MAP_H; y++)
+          for (let x = 0; x < MAP_W; x++) if (visible[y][x]) explored[y][x] = true;
+        return { ...gs, map: newMap, visible, explored, turn: gs.turn + 1 };
+      }
+
+      const mIdx = gs.monsters.findIndex((m) => m.x === nx && m.y === ny && m.hp > 0);
+      if (mIdx >= 0) {
+        const m = { ...gs.monsters[mIdx] };
+        const dmg = Math.max(1, gs.player.atk + rng(0, 2));
+        m.hp -= dmg;
+        addMsg(`⚔️ ${m.name}に${dmg}ダメージ！`);
+        const newMonsters = [...gs.monsters];
+        if (m.hp <= 0) {
+          addMsg(`💥 ${m.name}を倒した！ +${m.exp}EXP`);
+          let p = { ...gs.player, exp: gs.player.exp + m.exp };
+          if (p.exp >= p.expNext) {
+            p.level += 1; p.exp -= p.expNext;
+            p.expNext = Math.floor(p.expNext * 1.5);
+            p.maxHp += 5; p.hp = Math.min(p.hp + 10, p.maxHp); p.atk += 1;
+            addMsg(`🎉 レベルアップ！ Lv.${p.level}`);
+          }
+          newMonsters.splice(mIdx, 1);
+          gs = { ...gs, player: p, monsters: newMonsters };
+        } else {
+          newMonsters[mIdx] = m;
+          gs = { ...gs, monsters: newMonsters };
+        }
+      } else {
+        gs = { ...gs, player: { ...gs.player, x: nx, y: ny } };
+
+        const iIdx = gs.items.findIndex((it) => it.x === nx && it.y === ny);
+        if (iIdx >= 0) {
+          const item = gs.items[iIdx];
+          const newItems = [...gs.items]; newItems.splice(iIdx, 1);
+          let p = { ...gs.player };
+          switch (item.type) {
+            case "heal": p.hp = Math.min(p.hp + item.value, p.maxHp); addMsg(`${item.ch} ${item.name}を使った！ HP+${item.value}`); break;
+            case "weapon": p.atk += item.value; addMsg(`🗡️ ${item.name}を拾った！ ATK+${item.value}`); break;
+            case "armor": p.def += item.value; addMsg(`🛡️ ${item.name}を拾った！ DEF+${item.value}`); break;
+            case "gold": p.gold += item.value; addMsg(`🪙 ${item.value}G 手に入れた！`); break;
+            case "scroll": p.hp = Math.min(p.hp + 5, p.maxHp); p.atk += 1; addMsg(`📜 不思議な巻物... ATK+1, HP+5`); break;
+            case "fullheal": p.hp = p.maxHp; addMsg(`🔮 ${item.name}！ HPが全回復した！`); break;
+          }
+          gs = { ...gs, items: newItems, player: p };
+        }
+
+        if (gs.map[ny][nx] === T.TREASURE) {
+          addMsg("👑 伝説の宝物を手に入れた！！");
+          addMsg("🏆 ダンジョンクリア！！！");
+          return { ...gs, victory: true };
+        }
+        if (gs.map[ny][nx] === T.STAIR_DOWN) {
+          addMsg(`⬇️ 地下${gs.floor + 1}階に降りた...`);
+          saveFloor(gs);
+          setTimeout(() => initGame(gs.floor + 1, gs.player, 'down'), 50);
+          return gs;
+        }
+        if (gs.map[ny][nx] === T.STAIR_UP && gs.floor > 1) {
+          addMsg(`⬆️ 地下${gs.floor - 1}階に上がった`);
+          saveFloor(gs);
+          setTimeout(() => initGame(gs.floor - 1, gs.player, 'up'), 50);
+          return gs;
+        }
+      }
+
+      const visible = computeFov(gs.map, gs.player.x, gs.player.y, FOV_RADIUS);
+      const explored = gs.explored.map((row) => [...row]);
+      for (let y = 0; y < MAP_H; y++)
+        for (let x = 0; x < MAP_W; x++) if (visible[y][x]) explored[y][x] = true;
+      gs = { ...gs, visible, explored };
+      gs = processTurn(gs);
+      if (gs.player.hp <= 0) { addMsg("💀 あなたは死んだ..."); gs = { ...gs, gameOver: true }; }
+      return gs;
+    });
+  }, [addMsg, processTurn, initGame, saveFloor]);
+
+  useEffect(() => {
+    const handleKey = (e) => {
+      const keyMap = {
+        ArrowUp: [0,-1], ArrowDown: [0,1], ArrowLeft: [-1,0], ArrowRight: [1,0],
+        w: [0,-1], s: [0,1], a: [-1,0], d: [1,0],
+        W: [0,-1], S: [0,1], A: [-1,0], D: [1,0],
+        q: [-1,-1], e: [1,-1], z: [-1,1], c: [1,1],
+      };
+      const dir = keyMap[e.key];
+      if (dir) { e.preventDefault(); movePlayer(dir[0], dir[1]); }
+      if ((e.key === "r" || e.key === "R") && (gameState?.gameOver || gameState?.victory)) {
+        setMessages(["⚔️ 新たな冒険が始まる..."]); floorCacheRef.current = {}; initGame();
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [movePlayer, gameState, initGame]);
+
+  const msgRef = useRef(null);
+  useEffect(() => { if (msgRef.current) msgRef.current.scrollTop = msgRef.current.scrollHeight; }, [messages]);
+  useEffect(() => { containerRef.current?.focus(); }, []);
+
+  if (!started) return <StartScreen onStart={() => setStarted(true)} />;
+  if (!gameState) return <div style={{ color: "#eee", padding: 20 }}>Loading...</div>;
+
+  const { map, player, monsters, items, visible, explored, floor, turn, gameOver, victory } = gameState;
+  const { tileSize, vpW, vpH, isMobile } = layout;
+  const camX = clamp(player.x - Math.floor(vpW / 2), 0, MAP_W - vpW);
+  const camY = clamp(player.y - Math.floor(vpH / 2), 0, MAP_H - vpH);
+  const hpPct = Math.max(0, (player.hp / player.maxHp) * 100);
+  const expPct = (player.exp / player.expNext) * 100;
+
+  return (
+    <div ref={containerRef} tabIndex={0} style={{
+      background: "#0d0d1a", color: "#ddd", fontFamily: "'Courier New', monospace",
+      width: "100%", maxWidth: isMobile ? "100%" : 820, margin: "0 auto", padding: isMobile ? 6 : 12, outline: "none",
+      display: "flex", flexDirection: "column", gap: isMobile ? 4 : 8, fontSize: isMobile ? 11 : 13, userSelect: "none",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #333", paddingBottom: isMobile ? 3 : 6 }}>
+        <div style={{ fontSize: isMobile ? 13 : 16, fontWeight: "bold", color: "#f8d870" }}>
+          🏰 AI館ダンジョン <span style={{ fontSize: isMobile ? 10 : 12, color: "#888" }}>地下{floor}階(R{floor})</span>
+        </div>
+        {!isMobile && <div style={{ fontSize: 11, color: "#666" }}>Turn {turn} | WASD/矢印で移動 | QEZCで斜め</div>}
+      </div>
+
+      <div style={{ display: "flex", gap: isMobile ? 6 : 16, flexWrap: "wrap", fontSize: isMobile ? 10 : 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+          <span>❤️</span>
+          <div style={{ width: isMobile ? 60 : 100, height: isMobile ? 8 : 10, background: "#333", borderRadius: 5, overflow: "hidden" }}>
+            <div style={{ width: `${hpPct}%`, height: "100%", background: hpPct > 30 ? "#4a4" : "#f44", transition: "width 0.3s" }} />
+          </div>
+          <span style={{ color: hpPct > 30 ? "#4a4" : "#f44" }}>{player.hp}/{player.maxHp}</span>
+        </div>
+        <span>⚔️{player.atk}</span>
+        <span>🛡️{player.def}</span>
+        <span>Lv.{player.level}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <span>EXP</span>
+          <div style={{ width: 60, height: 8, background: "#333", borderRadius: 4, overflow: "hidden" }}>
+            <div style={{ width: `${expPct}%`, height: "100%", background: "#48f", transition: "width 0.3s" }} />
+          </div>
+        </div>
+        <span>🪙{player.gold}</span>
+      </div>
+
+      <div style={{
+        display: "grid", gridTemplateColumns: `repeat(${vpW}, ${tileSize}px)`,
+        gridTemplateRows: `repeat(${vpH}, ${tileSize}px)`, gap: 0, justifyContent: "center",
+        border: "2px solid #2a2a4a", borderRadius: 4, overflow: "hidden", background: "#000",
+      }}>
+        {Array.from({ length: vpH }, (_, vy) =>
+          Array.from({ length: vpW }, (_, vx) => {
+            const mx = camX + vx, my = camY + vy;
+            const isVisible = visible[my]?.[mx], isExplored = explored[my]?.[mx];
+            const tile = map[my]?.[mx] ?? T.WALL;
+            const tileInfo = TILE_CH[tile];
+            const isPlayer = mx === player.x && my === player.y;
+            const monster = isVisible ? monsters.find((m) => m.x === mx && m.y === my && m.hp > 0) : null;
+            const item = isVisible ? items.find((it) => it.x === mx && it.y === my) : null;
+
+            let ch = "", fg = tileInfo.fg, bg = tileInfo.bg;
+            if (!isExplored) { bg = "#000"; ch = ""; }
+            else if (!isVisible) { bg = "#0a0a15"; fg = "#333"; ch = tileInfo.ch; }
+            else { ch = tileInfo.ch; }
+
+            if (isPlayer) { ch = "🦊"; fg = "#fff"; }
+            else if (monster) { ch = monster.ch; fg = monster.color; }
+            else if (item) { ch = item.ch; fg = item.color; }
+
+            return (
+              <div key={`${vx}-${vy}`} style={{
+                width: tileSize, height: tileSize, background: bg, color: fg,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: tile === T.FLOOR && !isPlayer && !monster && !item ? (isMobile ? 8 : 10) : (isMobile ? 12 : 15),
+                lineHeight: 1, opacity: isVisible ? 1 : isExplored ? 0.4 : 0, transition: "opacity 0.15s",
+              }}>{ch}</div>
+            );
+          })
+        )}
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: isMobile ? 12 : 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(3, ${isMobile ? 44 : 36}px)`, gridTemplateRows: `repeat(3, ${isMobile ? 44 : 36}px)`, gap: 2 }}>
+          {[
+            ["↖",-1,-1],["↑",0,-1],["↗",1,-1],
+            ["←",-1,0],["·",0,0],["→",1,0],
+            ["↙",-1,1],["↓",0,1],["↘",1,1],
+          ].map(([label,dx,dy], i) => (
+            <button key={i} onClick={() => { if (dx !== 0 || dy !== 0) movePlayer(dx, dy); }}
+              disabled={dx === 0 && dy === 0} style={{
+                width: isMobile ? 44 : 36, height: isMobile ? 44 : 36, background: dx === 0 && dy === 0 ? "#1a1a2e" : "#2a2a4a",
+                color: "#aaa", border: "1px solid #333", borderRadius: 4,
+                cursor: dx === 0 && dy === 0 ? "default" : "pointer",
+                fontSize: isMobile ? 18 : 16, display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
+            }}>{label}</button>
+          ))}
+        </div>
+        <button onClick={() => {
+          if (MxADV_Bridge.isEmbedded) {
+            MxADV_Bridge.endGame({ status: "escape", score: player.gold, floor: floor, level: player.level });
+          } else {
+            history.back();
+          }
+        }} style={{
+          padding: isMobile ? "10px 14px" : "8px 16px", background: "#3a3a4a", color: "#aaa",
+          border: "1px solid #555", borderRadius: 6, fontSize: isMobile ? 13 : 12, cursor: "pointer",
+        }}>🚪 やめる</button>
+      </div>
+
+      <div ref={msgRef} style={{
+        height: isMobile ? 60 : 90, overflowY: "auto", background: "#0a0a18", border: "1px solid #2a2a4a",
+        borderRadius: 4, padding: "4px 8px", fontSize: isMobile ? 10 : 12, lineHeight: 1.6,
+      }}>
+        {messages.map((m, i) => (
+          <div key={i} style={{ color: i === messages.length - 1 ? "#eee" : "#777" }}>{m}</div>
+        ))}
+      </div>
+
+      {(gameOver || victory) && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)",
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 100,
+        }}>
+          <div style={{ fontSize: 48, marginBottom: 16 }}>{victory ? "🏆" : "💀"}</div>
+          <div style={{ fontSize: 24, color: victory ? "#f8d870" : "#f44", fontWeight: "bold", marginBottom: 8 }}>
+            {victory ? "DUNGEON CLEAR!" : "GAME OVER"}
+          </div>
+          <div style={{ color: "#888", marginBottom: 16 }}>
+            地下{floor}階 | Lv.{player.level} | {player.gold}G | Turn {turn}
+          </div>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center" }}>
+            {!(victory && MxADV_Bridge.isEmbedded) && (
+              <button onClick={() => { setMessages(["⚔️ 新たな冒険が始まる..."]); floorCacheRef.current = {}; initGame(); }}
+                style={{ padding: "10px 30px", background: "#4a4", color: "#fff", border: "none", borderRadius: 6, fontSize: 16, cursor: "pointer" }}>
+                🔄 リトライ
+              </button>
+            )}
+            <button onClick={() => {
+              if (MxADV_Bridge.isEmbedded) {
+                MxADV_Bridge.endGame({ status: victory ? "clear" : "escape", score: player.gold, floor: floor, level: player.level });
+              } else {
+                history.back();
+              }
+            }}
+              style={{ padding: "10px 30px", background: "#448", color: "#fff", border: "none", borderRadius: 6, fontSize: 16, cursor: "pointer" }}>
+              {victory ? "📖 ADVに戻る" : "🚪 やめる"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ========================================
+// MxADVeng Bridge
+// ========================================
+const MxADV_Bridge = {
+    isEmbedded: false,
+    config: {},
+    init() {
+        window.addEventListener("message", (ev) => {
+            if (ev.data?.type === "MxADV_MinigameStart") {
+                this.isEmbedded = true;
+                this.config = ev.data.config || {};
+                this.onStart(this.config);
+            }
+        });
+    },
+    onStart(config) {
+        if (config.max_floor) MAX_FLOOR = config.max_floor;
+        if (config.difficulty === "easy") {
+            MONSTERS_PER_FLOOR = 3;
+            ITEMS_PER_FLOOR = 10;
+        }
+        console.log("[MxADV Bridge] started with config:", config);
+    },
+    endGame(result) {
+        if (this.isEmbedded) {
+            window.parent.postMessage({ type: "MxADV_MinigameEnd", result }, "*");
+        } else {
+            console.log("[MxADV Bridge] standalone result:", result);
+        }
+    },
+};
+MxADV_Bridge.init();
+
+ReactDOM.createRoot(document.getElementById("root")).render(<RoguelikeGame />);
+</script>
+</body>
+</html>
